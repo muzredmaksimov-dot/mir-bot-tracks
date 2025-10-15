@@ -128,26 +128,54 @@ def start_cmd(message):
 @bot.message_handler(content_types=['photo'])
 def photo_handler(message):
     bot.reply_to(message, "Анализирую твоё фото… 🧠")
-    file_info = bot.get_file(message.photo[-1].file_id)
-    downloaded_file = bot.download_file(file_info.file_path)
-    tmp_path = "photo.jpg"
-    with open(tmp_path, "wb") as f:
-        f.write(downloaded_file)
-    emotion = analyze_emotion(tmp_path)
-    mood = EMOTION_MAP.get(emotion, "calm")
-    name, url = choose_track(mood)
-    if not url:
-        bot.reply_to(message, "Не смог найти трек 😞")
+    
+    # Скачиваем фото
+    try:
+        file_info = bot.get_file(message.photo[-1].file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        tmp_path = "photo.jpg"
+        with open(tmp_path, "wb") as f:
+            f.write(downloaded_file)
+    except Exception as e:
+        bot.reply_to(message, f"Ошибка при загрузке фото: {e}")
         return
+
+    # Анализ эмоции с тайм-аутом
+    try:
+        emotion = analyze_emotion(tmp_path)
+    except Exception as e:
+        print(f"⚠️ analyze_emotion failed: {e}")
+        emotion = "neutral"
+
+    # Сопоставление с настроением
+    mood = EMOTION_MAP.get(emotion, "calm")
+
+    # Выбор трека
+    try:
+        name, url = choose_track(mood)
+    except Exception as e:
+        print(f"⚠️ choose_track failed: {e}")
+        name, url = None, None
+
+    if not url:
+        bot.reply_to(message, "Не смог найти трек для твоего настроения 😞")
+        return
+
+    # Отправляем трек пользователю
     caption = f"Твоё настроение — *{mood}* ({emotion}) 🎧\nТрек дня: {name}"
-    bot.send_audio(message.chat.id, url, caption=caption, parse_mode="Markdown")
+    try:
+        bot.send_audio(message.chat.id, url, caption=caption, parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"Ошибка при отправке трека: {e}")
+        return
+
+    # Сохраняем данные в CSV на GitHub
     ts = datetime.datetime.utcnow().isoformat() + "Z"
     row = [ts, message.from_user.username or message.from_user.id, mood, url]
     try:
         append_to_csv(row)
     except Exception as e:
-        logger.warning(f"CSV update failed: {e}")
-
+        print(f"⚠️ CSV update failed: {e}")
 # === Flask routes ===
 @app.route(f'/webhook/{TOKEN}', methods=['POST'])
 def webhook():
