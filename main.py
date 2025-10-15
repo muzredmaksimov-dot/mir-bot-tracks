@@ -1,134 +1,130 @@
 import os
-import io
-import csv
-import base64
-import random
-import datetime
 import time
-import logging
-
-from flask import Flask, request
-from telebot import TeleBot, types
-from PIL import Image
-
-try:
-    from deepface import DeepFace
-    HAS_DEEPFACE = True
-except:
-    HAS_DEEPFACE = False
-
-try:
-    from fer import FER
-    HAS_FER = True
-except:
-    HAS_FER = False
-
+import threading
+import datetime
 import requests
+import base64
+import csv
+import io
+from PIL import Image
+import numpy as np
+from flask import Flask, request
+import telebot
+from fer import FER
 
-# === Настройки ===
-TOKEN = os.getenv("BOT_TOKEN")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_OWNER = os.getenv("GITHUB_OWNER")
-GITHUB_REPO = os.getenv("GITHUB_REPO")
-GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+# ========================
+# ==== ПЕРЕМЕННЫЕ =======
+# ========================
+TOKEN = os.environ.get("BOT_TOKEN")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_OWNER = os.environ.get("GITHUB_OWNER")
+GITHUB_REPO = os.environ.get("GITHUB_REPO")
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 
-CSV_PATH = "stats/emotions.csv"
-TRACKS_BASE_PATH = "tracks"
+bot = telebot.TeleBot(TOKEN)
+app = Flask(__name__)
 
+# Сопоставление эмоций с папками треков
 EMOTION_MAP = {
     "happy": "happy",
     "sad": "sad",
     "angry": "angry",
-    "surprise": "surprise",
     "neutral": "calm",
-    "fear": "surprise",
-    "disgust": "angry"
+    "surprise": "happy",
+    "fear": "calm",
+    "disgust": "calm"
 }
 
-bot = TeleBot(TOKEN)
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ========================
+# ==== ФУНКЦИИ ==========
+# ========================
 
-RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}/"
+def analyze_emotion(image_path: str):
+    result = {"emotion": "neutral"}
 
-# === GitHub API ===
-def gh_get_file(file_path):
-    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{file_path}?ref={GITHUB_BRANCH}"
+    def run_analysis():
+        try:
+            img = np.array(Image.open(image_path).convert("RGB"))
+            detector = FER(mtcnn=True)
+            label, score = detector.top_emotion(img)
+            if label:
+                result["emotion"] = label.lower()
+            print(f"DEBUG: emotion detected = {result['emotion']}, score = {score}")
+        except Exception as e:
+            print(f"⚠️ Emotion analysis error: {e}")
+            result["emotion"] = "neutral"
+
+    t = threading.Thread(target=run_analysis)
+    t.start()
+    t.join(timeout=15)
+    if t.is_alive():
+        print("⚠️ Emotion not detected — timeout")
+        return "neutral"
+
+    return result["emotion"]
+
+def choose_track(mood):
+    """
+    Берёт случайный трек из GitHub папки mood
+    """
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/tracks/{mood}?ref={GITHUB_BRANCH}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    r = requests.get(url, headers=headers)
-    if r.status_code == 404:
-        return None
-    r.raise_for_status()
-    return r.json()
-
-def gh_put_file(file_path, content_bytes, message, sha=None):
-    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{file_path}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    b64 = base64.b64encode(content_bytes).decode("utf-8")
-    payload = {"message": message, "content": b64, "branch": GITHUB_BRANCH}
-    if sha:
-        payload["sha"] = sha
-    r = requests.put(url, headers=headers, json=payload)
-    r.raise_for_status()
-    return r.json()
+    resp = requests.get(url, headers=headers)
+    if resp.status_code != 200:
+        raise Exception(f"Cannot fetch tracks: {resp.status_code} {resp.text}")
+    data = resp.json()
+    if not data:
+        raise Exception("No tracks found")
+    track = np.random.choice(data)
+    return track["name"], track["download_url"]
 
 def append_to_csv(row):
-    file_json = gh_get_file(CSV_PATH)
-    if file_json:
-        sha = file_json["sha"]
-        text = base64.b64decode(file_json["content"]).decode("utf-8")
-    else:
+    csv_path = "stats/emotions.csv"
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{csv_path}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }
+
+    resp = requests.get(url, headers=headers, params={"ref": GITHUB_BRANCH})
+    if resp.status_code == 200:
+        content = base64.b64decode(resp.json()["content"]).decode("utf-8")
+        sha = resp.json()["sha"]
+    elif resp.status_code == 404:
+        content = ""
         sha = None
-        text = "timestamp,username,emotion,track_url\n"
-    buf = io.StringIO()
-    buf.write(text)
-    writer = csv.writer(buf)
+    else:
+        raise Exception(f"GitHub GET error: {resp.status_code} {resp.text}")
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    if content.strip():
+        reader = csv.reader(io.StringIO(content))
+        for r in reader:
+            writer.writerow(r)
     writer.writerow(row)
-    new_bytes = buf.getvalue().encode("utf-8")
-    gh_put_file(CSV_PATH, new_bytes, f"add emotion: {row[2]} @ {row[0]}", sha)
+    csv_str = output.getvalue()
 
-# === Эмоции ===
-def analyze_emotion(image_path: str):
-    if HAS_DEEPFACE:
-        try:
-            res = DeepFace.analyze(img_path=image_path, actions=["emotion"])
-            return res.get("dominant_emotion").lower()
-        except Exception as e:
-            logger.warning(f"DeepFace error: {e}")
-    if HAS_FER:
-        import numpy as np
-        img = Image.open(image_path).convert("RGB")
-        detector = FER(mtcnn=True)
-        try:
-            label, score = detector.top_emotion(np.array(img))
-            return label.lower()
-        except Exception as e:
-            logger.warning(f"FER error: {e}")
-    return "neutral"
+    data = {
+        "message": "Update emotions.csv",
+        "content": base64.b64encode(csv_str.encode("utf-8")).decode("utf-8"),
+        "branch": GITHUB_BRANCH
+    }
+    if sha:
+        data["sha"] = sha
 
-# === Выбор трека ===
-def choose_track(mood):
-    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{TRACKS_BASE_PATH}/{mood}?ref={GITHUB_BRANCH}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    r = requests.get(url, headers=headers)
-    r.raise_for_status()
-    files = r.json()
-    mp3s = [f for f in files if f["type"]=="file" and f["name"].lower().endswith((".mp3",".m4a",".ogg"))]
-    if not mp3s:
-        return None, None
-    pick = random.choice(mp3s)
-    return pick["name"], f"{RAW_BASE}{TRACKS_BASE_PATH}/{mood}/{pick['name']}"
+    put_resp = requests.put(url, headers=headers, json=data)
+    if put_resp.status_code not in [200, 201]:
+        raise Exception(f"GitHub PUT error: {put_resp.status_code} {put_resp.text}")
 
-# === Хэндлеры ===
-@bot.message_handler(commands=['start'])
-def start_cmd(message):
-    bot.reply_to(message, "Привет! Отправь своё селфи — я подберу трек под настроение 🎶")
+# ========================
+# ==== ОБРАБОТЧИК ФОТО ==
+# ========================
 
 @bot.message_handler(content_types=['photo'])
 def photo_handler(message):
     bot.reply_to(message, "Анализирую твоё фото… 🧠")
-    
+
     # Скачиваем фото
     try:
         file_info = bot.get_file(message.photo[-1].file_id)
@@ -140,14 +136,8 @@ def photo_handler(message):
         bot.reply_to(message, f"Ошибка при загрузке фото: {e}")
         return
 
-    # Анализ эмоции с тайм-аутом
-    try:
-        emotion = analyze_emotion(tmp_path)
-    except Exception as e:
-        print(f"⚠️ analyze_emotion failed: {e}")
-        emotion = "neutral"
-
-    # Сопоставление с настроением
+    # Анализ эмоции
+    emotion = analyze_emotion(tmp_path)
     mood = EMOTION_MAP.get(emotion, "calm")
 
     # Выбор трека
@@ -155,13 +145,10 @@ def photo_handler(message):
         name, url = choose_track(mood)
     except Exception as e:
         print(f"⚠️ choose_track failed: {e}")
-        name, url = None, None
-
-    if not url:
         bot.reply_to(message, "Не смог найти трек для твоего настроения 😞")
         return
 
-    # Отправляем трек пользователю
+    # Отправка трека
     caption = f"Твоё настроение — *{mood}* ({emotion}) 🎧\nТрек дня: {name}"
     try:
         bot.send_audio(message.chat.id, url, caption=caption, parse_mode="Markdown")
@@ -169,38 +156,46 @@ def photo_handler(message):
         bot.reply_to(message, f"Ошибка при отправке трека: {e}")
         return
 
-    # Сохраняем данные в CSV на GitHub
+    # Запись в CSV
     ts = datetime.datetime.utcnow().isoformat() + "Z"
     row = [ts, message.from_user.username or message.from_user.id, mood, url]
     try:
         append_to_csv(row)
     except Exception as e:
         print(f"⚠️ CSV update failed: {e}")
-# === Flask routes ===
+
+# ========================
+# ==== FLASK WEBHOOK =====
+# ========================
+
 @app.route(f'/webhook/{TOKEN}', methods=['POST'])
 def webhook():
     if request.headers.get('content-type')=='application/json':
-        update = types.Update.de_json(request.get_data().decode('utf-8'))
+        update = telebot.types.Update.de_json(request.get_data().decode('utf-8'))
         bot.process_new_updates([update])
         return ''
-    return 'Bad Request',400
+    return 'Bad Request', 400
 
 @app.route('/')
-def index(): return 'Music Bot running!'
+def index(): 
+    return 'Music Test Bot running!'
 
 @app.route('/health')
-def health(): return 'OK'
+def health(): 
+    return 'OK'
 
-# === Main ===
+# ========================
+# ==== ЗАПУСК ===========
+# ========================
+
 if __name__=="__main__":
-    print("🚀 Бот запускается!")
+    print("🚀 Бот запущен!")
     if 'RENDER' in os.environ:
         port = int(os.environ.get('PORT', 10000))
         try:
             bot.remove_webhook()
             time.sleep(1)
             bot.set_webhook(url=f"https://mir-bot-tracks.onrender.com/webhook/{TOKEN}")
-            print("✅ Вебхук установлен")
         except Exception as e:
             print(f"❌ Вебхук: {e}")
         app.run(host='0.0.0.0', port=port)
