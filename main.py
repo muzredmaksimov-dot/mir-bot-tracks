@@ -4,41 +4,33 @@ import csv
 import base64
 import random
 import datetime
-import asyncio
+import time
 import logging
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import CommandStart
-from aiohttp import web, ClientSession, ClientResponseError
+from flask import Flask, request
+from telebot import TeleBot, types
 from PIL import Image
 
 try:
     from deepface import DeepFace
     HAS_DEEPFACE = True
-except Exception:
+except:
     HAS_DEEPFACE = False
+
 try:
     from fer import FER
     HAS_FER = True
-except Exception:
+except:
     HAS_FER = False
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+import requests
+
+# === Настройки ===
+TOKEN = os.getenv("BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_OWNER = os.getenv("GITHUB_OWNER")
 GITHUB_REPO = os.getenv("GITHUB_REPO")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-PORT = int(os.getenv("PORT", 8080))
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-GITHUB_API = "https://api.github.com"
-RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}/"
 
 CSV_PATH = "stats/emotions.csv"
 TRACKS_BASE_PATH = "tracks"
@@ -53,138 +45,137 @@ EMOTION_MAP = {
     "disgust": "angry"
 }
 
-# --- GitHub API ---
-async def gh_api(session, method, path, **kwargs):
-    url = f"{GITHUB_API}/repos/{GITHUB_OWNER}/{GITHUB_REPO}{path}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
-    async with session.request(method, url, headers=headers, **kwargs) as resp:
-        if resp.status >= 400:
-            text = await resp.text()
-            logger.error(f"GitHub API error {resp.status}: {text}")
-            raise ClientResponseError(resp.request_info, resp.history, status=resp.status)
-        return await resp.json()
+bot = TeleBot(TOKEN)
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-async def gh_get_file(session, file_path):
-    return await gh_api(session, "GET", f"/contents/{file_path}?ref={GITHUB_BRANCH}")
+RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}/"
 
-async def gh_put_file(session, file_path, content_bytes, message, sha=None):
+# === GitHub API ===
+def gh_get_file(file_path):
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{file_path}?ref={GITHUB_BRANCH}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    r = requests.get(url, headers=headers)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json()
+
+def gh_put_file(file_path, content_bytes, message, sha=None):
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{file_path}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     b64 = base64.b64encode(content_bytes).decode("utf-8")
     payload = {"message": message, "content": b64, "branch": GITHUB_BRANCH}
     if sha:
         payload["sha"] = sha
-    return await gh_api(session, "PUT", f"/contents/{file_path}", json=payload)
+    r = requests.put(url, headers=headers, json=payload)
+    r.raise_for_status()
+    return r.json()
 
-# --- Эмоции ---
-async def analyze_emotion(image_path: str):
-    if HAS_DEEPFACE:
-        def run_deepface():
-            res = DeepFace.analyze(img_path=image_path, actions=["emotion"])
-            return res.get("dominant_emotion")
-        try:
-            label = await asyncio.to_thread(run_deepface)
-            if label:
-                return label.lower()
-        except Exception as e:
-            logger.warning(f"DeepFace error: {e}")
-    if HAS_FER:
-        from numpy import array
-        img = Image.open(image_path).convert("RGB")
-        detector = FER(mtcnn=True)
-        try:
-            label, score = detector.top_emotion(array(img))
-            return label.lower()
-        except Exception as e:
-            logger.warning(f"FER error: {e}")
-    return "neutral"
-
-# --- CSV обновление ---
-async def append_to_csv(session, row):
-    try:
-        file_json = await gh_get_file(session, CSV_PATH)
+def append_to_csv(row):
+    file_json = gh_get_file(CSV_PATH)
+    if file_json:
         sha = file_json["sha"]
         text = base64.b64decode(file_json["content"]).decode("utf-8")
-    except ClientResponseError as e:
-        if e.status == 404:
-            text = "timestamp,username,emotion,track_url\n"
-            sha = None
-        else:
-            raise
+    else:
+        sha = None
+        text = "timestamp,username,emotion,track_url\n"
     buf = io.StringIO()
     buf.write(text)
     writer = csv.writer(buf)
     writer.writerow(row)
     new_bytes = buf.getvalue().encode("utf-8")
-    msg = f"add emotion: {row[2]} @ {row[0]}"
-    return await gh_put_file(session, CSV_PATH, new_bytes, msg, sha)
+    gh_put_file(CSV_PATH, new_bytes, f"add emotion: {row[2]} @ {row[0]}", sha)
 
-# --- Выбор трека ---
-async def choose_track(session, mood):
-    try:
-        files = await gh_api(session, "GET", f"/contents/{TRACKS_BASE_PATH}/{mood}?ref={GITHUB_BRANCH}")
-        mp3s = [f for f in files if f["type"] == "file" and f["name"].lower().endswith((".mp3", ".m4a", ".ogg"))]
-        if not mp3s:
-            return None, None
-        pick = random.choice(mp3s)
-        return pick["name"], f"{RAW_BASE}{TRACKS_BASE_PATH}/{mood}/{pick['name']}"
-    except Exception as e:
-        logger.warning(f"choose_track error: {e}")
-        return None, None
-
-@dp.message(CommandStart())
-async def start_cmd(m: types.Message):
-    await m.answer("Привет! Отправь своё селфи — я подберу трек под настроение 🎶")
-
-@dp.message(lambda m: m.photo)
-async def photo_handler(m: types.Message):
-    await m.answer("Анализирую твоё фото… 🧠")
-    photo = m.photo[-1]
-    file = await bot.get_file(photo.file_id)
-    bio = io.BytesIO()
-    await bot.download_file(file.file_path, bio)
-    tmp = "photo.jpg"
-    with open(tmp, "wb") as f:
-        f.write(bio.getbuffer())
-
-    emotion = await analyze_emotion(tmp)
-    mood = EMOTION_MAP.get(emotion, "calm")
-
-    async with ClientSession() as s:
-        name, url = await choose_track(s, mood)
-        if not url:
-            await m.answer("Не смог найти трек 😞")
-            return
-        caption = f"Твоё настроение — *{mood}* ({emotion}) 🎧\nТрек дня: {name}"
-        await bot.send_audio(m.chat.id, url, caption=caption, parse_mode="Markdown")
-
-        ts = datetime.datetime.utcnow().isoformat() + "Z"
-        row = [ts, m.from_user.username or m.from_user.id, mood, url]
+# === Эмоции ===
+def analyze_emotion(image_path: str):
+    if HAS_DEEPFACE:
         try:
-            await append_to_csv(s, row)
-        except Exception:
-            logger.warning("CSV update failed")
+            res = DeepFace.analyze(img_path=image_path, actions=["emotion"])
+            return res.get("dominant_emotion").lower()
+        except Exception as e:
+            logger.warning(f"DeepFace error: {e}")
+    if HAS_FER:
+        import numpy as np
+        img = Image.open(image_path).convert("RGB")
+        detector = FER(mtcnn=True)
+        try:
+            label, score = detector.top_emotion(np.array(img))
+            return label.lower()
+        except Exception as e:
+            logger.warning(f"FER error: {e}")
+    return "neutral"
 
-# --- aiohttp webhook server ---
-async def handle_webhook(request):
-    body = await request.text()
-    update = types.Update.model_validate_json(body)
-    await dp.feed_update(bot, update)
-    return web.Response()
+# === Выбор трека ===
+def choose_track(mood):
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{TRACKS_BASE_PATH}/{mood}?ref={GITHUB_BRANCH}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    r = requests.get(url, headers=headers)
+    r.raise_for_status()
+    files = r.json()
+    mp3s = [f for f in files if f["type"]=="file" and f["name"].lower().endswith((".mp3",".m4a",".ogg"))]
+    if not mp3s:
+        return None, None
+    pick = random.choice(mp3s)
+    return pick["name"], f"{RAW_BASE}{TRACKS_BASE_PATH}/{mood}/{pick['name']}"
 
-async def on_startup(app):
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(WEBHOOK_URL)
-    logger.info(f"Webhook установлен: {WEBHOOK_URL}")
+# === Хэндлеры ===
+@bot.message_handler(commands=['start'])
+def start_cmd(message):
+    bot.reply_to(message, "Привет! Отправь своё селфи — я подберу трек под настроение 🎶")
 
-async def on_shutdown(app):
-    await bot.session.close()
+@bot.message_handler(content_types=['photo'])
+def photo_handler(message):
+    bot.reply_to(message, "Анализирую твоё фото… 🧠")
+    file_info = bot.get_file(message.photo[-1].file_id)
+    downloaded_file = bot.download_file(file_info.file_path)
+    tmp_path = "photo.jpg"
+    with open(tmp_path, "wb") as f:
+        f.write(downloaded_file)
+    emotion = analyze_emotion(tmp_path)
+    mood = EMOTION_MAP.get(emotion, "calm")
+    name, url = choose_track(mood)
+    if not url:
+        bot.reply_to(message, "Не смог найти трек 😞")
+        return
+    caption = f"Твоё настроение — *{mood}* ({emotion}) 🎧\nТрек дня: {name}"
+    bot.send_audio(message.chat.id, url, caption=caption, parse_mode="Markdown")
+    ts = datetime.datetime.utcnow().isoformat() + "Z"
+    row = [ts, message.from_user.username or message.from_user.id, mood, url]
+    try:
+        append_to_csv(row)
+    except Exception as e:
+        logger.warning(f"CSV update failed: {e}")
 
-def main():
-    app = web.Application()
-    app.router.add_post("/webhook", handle_webhook)
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-    web.run_app(app, host="0.0.0.0", port=PORT)
+# === Flask routes ===
+@app.route(f'/webhook/{TOKEN}', methods=['POST'])
+def webhook():
+    if request.headers.get('content-type')=='application/json':
+        update = types.Update.de_json(request.get_data().decode('utf-8'))
+        bot.process_new_updates([update])
+        return ''
+    return 'Bad Request',400
 
-if __name__ == "__main__":
-    main()
+@app.route('/')
+def index(): return 'Music Bot running!'
 
+@app.route('/health')
+def health(): return 'OK'
+
+# === Main ===
+if __name__=="__main__":
+    print("🚀 Бот запускается!")
+    if 'RENDER' in os.environ:
+        port = int(os.environ.get('PORT', 10000))
+        try:
+            bot.remove_webhook()
+            time.sleep(1)
+            bot.set_webhook(url=f"https://mir-bot-tracks.onrender.com/webhook/{TOKEN}")
+            print("✅ Вебхук установлен")
+        except Exception as e:
+            print(f"❌ Вебхук: {e}")
+        app.run(host='0.0.0.0', port=port)
+    else:
+        bot.remove_webhook()
+        bot.polling(none_stop=True)
